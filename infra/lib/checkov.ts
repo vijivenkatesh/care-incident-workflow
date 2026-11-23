@@ -34,10 +34,29 @@ const BY_TYPE: Record<string, Skips> = {
   },
 };
 
+/**
+ * Deploy-time helpers that CDK creates and configures itself (S3 asset copy and
+ * auto-delete of the site bucket). They only run during `cdk deploy`/`destroy`, hold no
+ * application data, and their settings aren't exposed by the constructs.
+ */
+const CDK_INTERNAL = /\/Custom::(CDKBucketDeployment|S3AutoDeleteObjectsCustomResourceProvider)/;
+const CDK_INTERNAL_SKIPS: Record<string, Skips> = {
+  'AWS::Lambda::Function': {
+    CKV_AWS_115: 'CDK-managed deploy-time custom resource handler; runs only during stack deployment',
+    CKV_AWS_116: 'Invoked synchronously by CloudFormation, which reports failures itself; a DLQ never receives events',
+    CKV_AWS_117: 'CDK-managed deploy-time handler that calls S3/CloudFront APIs only; no access to the application VPC needed',
+    CKV_AWS_173: 'Environment holds no secrets, only CDK configuration; encrypted with the AWS-managed Lambda key',
+  },
+  'AWS::IAM::Policy': {
+    CKV_AWS_111: 'CDK BucketDeployment role: cloudfront:CreateInvalidation does not support resource-level scoping here',
+  },
+};
+
 export class CheckovSuppressions implements IAspect {
   visit(node: IConstruct): void {
-    if (node instanceof CfnResource && BY_TYPE[node.cfnResourceType]) {
-      skipCheckov(node, BY_TYPE[node.cfnResourceType]);
-    }
+    if (!(node instanceof CfnResource)) return;
+    const type = node.cfnResourceType;
+    if (BY_TYPE[type]) skipCheckov(node, BY_TYPE[type]);
+    if (CDK_INTERNAL_SKIPS[type] && CDK_INTERNAL.test(node.node.path)) skipCheckov(node, CDK_INTERNAL_SKIPS[type]);
   }
 }

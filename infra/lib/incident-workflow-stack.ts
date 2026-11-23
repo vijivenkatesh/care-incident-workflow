@@ -184,8 +184,8 @@ export class IncidentWorkflowStack extends Stack {
 
     // --------------------------------------------------------------- compute
     const code = lambda.Code.fromAsset(path.join(ROOT, 'services', 'src'), { exclude: ['**/__pycache__'] });
-    const fn = (id: string, handler: string, environment: Record<string, string>, timeout = 10) =>
-      new lambda.Function(this, id, {
+    const fn = (id: string, handler: string, environment: Record<string, string>, timeout = 10) => {
+      const f = new lambda.Function(this, id, {
         runtime: lambda.Runtime.PYTHON_3_12,
         architecture: lambda.Architecture.ARM_64,
         code,
@@ -202,6 +202,15 @@ export class IncidentWorkflowStack extends Stack {
           removalPolicy: RemovalPolicy.DESTROY,
         }),
       });
+      skipCheckov(f, {
+        // Reserved concurrency would fail deployment on new accounts (default limit 10) and is
+        // redundant: API Gateway stage throttling caps the APIs, SQS maxConcurrency caps consumers.
+        CKV_AWS_115: 'Concurrency is capped upstream by API Gateway throttling and SQS event source maxConcurrency',
+        CKV_AWS_116: 'Never invoked asynchronously: API Gateway calls are synchronous, SQS consumers use the queue redrive DLQ',
+        CKV_AWS_173: 'Environment holds only resource names, ARNs and URLs (secrets are in Secrets Manager); AWS-managed key',
+      });
+      return f;
+    };
 
     // ------------------------------------------------- frontend hosting (CDN)
     const siteBucket = new s3.Bucket(this, 'SiteBucket', {
@@ -216,8 +225,25 @@ export class IncidentWorkflowStack extends Stack {
     skipCheckov(siteBucket, {
       CKV_AWS_18: 'Private bucket read only by CloudFront through OAC; request logging belongs at CloudFront',
     });
+    // CloudFront standard logging writes objects with ACLs, so this bucket needs ObjectWriter ownership.
+    const cdnLogBucket = new s3.Bucket(this, 'CdnLogBucket', {
+      blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      enforceSSL: true,
+      objectOwnership: s3.ObjectOwnership.OBJECT_WRITER,
+      lifecycleRules: [{ expiration: Duration.days(90) }],
+      removalPolicy: RemovalPolicy.DESTROY,
+      autoDeleteObjects: true,
+    });
+    skipCheckov(cdnLogBucket, {
+      CKV_AWS_18: 'This is the access-log destination; logging it to another bucket would recurse',
+      CKV_AWS_21: 'Append-only access logs that expire after 90 days; versioning adds cost without recovery value',
+    });
     const distribution = new cloudfront.Distribution(this, 'Site', {
       defaultRootObject: 'index.html',
+      enableLogging: true,
+      logBucket: cdnLogBucket,
+      logFilePrefix: 'cloudfront/',
       defaultBehavior: {
         origin: origins.S3BucketOrigin.withOriginAccessControl(siteBucket),
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
@@ -228,6 +254,10 @@ export class IncidentWorkflowStack extends Stack {
         responseHttpStatus: 200,
         responsePagePath: '/index.html',
       })),
+    });
+    skipCheckov(distribution, {
+      CKV_AWS_68: 'Static SPA assets only, no server-side logic; WAF for CloudFront must live in us-east-1 and adds fixed cost',
+      CKV_AWS_174: 'Uses the default *.cloudfront.net certificate, whose TLS policy cannot be set; needs a custom domain and ACM cert',
     });
     const siteOrigin = `https://${distribution.distributionDomainName}`;
     const allowedOrigin = props.allowedOrigin ?? siteOrigin;
@@ -302,6 +332,8 @@ export class IncidentWorkflowStack extends Stack {
         accessLogFormat: apigw.AccessLogFormat.jsonWithStandardFields(),
       },
     });
+    const noCache = 'Responses are per-user (Cognito/IAM authorised) and reflect live workflow state; caching would serve stale or cross-user data';
+    skipCheckov(api.deploymentStage, { CKV_AWS_120: noCache });
     apiFn.addPermission('InvokeFromApiGateway', {
       principal: new iam.ServicePrincipal('apigateway.amazonaws.com'),
       sourceArn: api.arnForExecuteApi(),
@@ -310,7 +342,7 @@ export class IncidentWorkflowStack extends Stack {
     // ------------------------------------------- async consumers
     const auditFn = fn('AuditConsumer', 'audit_handler', { AUDIT_TABLE_NAME: auditTable.tableName });
     auditTable.grantWriteData(auditFn);
-    auditFn.addEventSource(new SqsEventSource(audit.queue, { batchSize: 10, reportBatchItemFailures: true }));
+    auditFn.addEventSource(new SqsEventSource(audit.queue, { batchSize: 10, reportBatchItemFailures: true, maxConcurrency: 5 }));
 
     // ----------------------- private API for service-to-service calls (IAM)
     const internalFn = fn('InternalApi', 'internal_api_handler', { TABLE_NAME: incidentsTable.tableName });
@@ -326,7 +358,16 @@ export class IncidentWorkflowStack extends Stack {
       description: 'Private API: reachable only through the VPC endpoint, IAM (SigV4) auth',
       endpointConfiguration: { types: [apigw.EndpointType.PRIVATE], vpcEndpoints: [executeApiEndpoint] },
       cloudWatchRole: false,
-      deployOptions: { stageName: 'internal', tracingEnabled: true, metricsEnabled: true },
+      deployOptions: {
+        stageName: 'internal',
+        tracingEnabled: true,
+        metricsEnabled: true,
+        accessLogDestination: new apigw.LogGroupLogDestination(new logs.LogGroup(this, 'InternalApiAccessLogs', {
+          retention: logs.RetentionDays.ONE_MONTH,
+          removalPolicy: RemovalPolicy.DESTROY,
+        })),
+        accessLogFormat: apigw.AccessLogFormat.jsonWithStandardFields(),
+      },
       defaultMethodOptions: { authorizationType: apigw.AuthorizationType.IAM },
       policy: new iam.PolicyDocument({
         statements: [
@@ -349,6 +390,9 @@ export class IncidentWorkflowStack extends Stack {
     internalApi.root
       .addResource('internal').addResource('incidents').addResource('{incidentId}').addResource('summary')
       .addMethod('GET', new apigw.LambdaIntegration(internalFn));
+    // Access logging needs the account-level CloudWatch role, which the public API creates.
+    internalApi.deploymentStage.node.addDependency(api.node.findChild('Account'));
+    skipCheckov(internalApi.deploymentStage, { CKV_AWS_120: noCache });
 
     regulatorFn.addEnvironment('INTERNAL_API_URL', internalApi.url);
     regulatorEndpoint.grantRead(regulatorFn);
@@ -361,7 +405,8 @@ export class IncidentWorkflowStack extends Stack {
       actions: ['execute-api:Invoke'],
       resources: [internalApi.arnForExecuteApi('GET', '/internal/incidents/*/summary', 'internal')],
     }));
-    regulatorFn.addEventSource(new SqsEventSource(regulator.queue, { batchSize: 1, reportBatchItemFailures: true }));
+    // Low concurrency protects the external regulator endpoint from bursts.
+    regulatorFn.addEventSource(new SqsEventSource(regulator.queue, { batchSize: 1, reportBatchItemFailures: true, maxConcurrency: 2 }));
 
     // ---------------------------------------------- frontend deployment
     const dist = path.join(ROOT, 'frontend', 'dist');

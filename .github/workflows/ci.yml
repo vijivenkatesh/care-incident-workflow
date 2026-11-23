@@ -91,7 +91,7 @@ jobs:
           framework: cloudformation
           quiet: true
           compact: true
-          soft_fail: true
+          soft_fail: false   # all findings are fixed or suppressed with a reason in infra/lib/checkov.ts
       - uses: actions/upload-artifact@v4
         with:
           name: cdk-out

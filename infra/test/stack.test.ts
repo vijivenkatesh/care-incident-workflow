@@ -91,6 +91,22 @@ test('every checkov suppression carries a justification', () => {
   }
 });
 
+test('CloudFront and both API stages write access logs', () => {
+  template.hasResourceProperties('AWS::CloudFront::Distribution', {
+    DistributionConfig: { Logging: { Bucket: Match.anyValue(), Prefix: 'cloudfront/' } },
+  });
+  const stages = template.findResources('AWS::ApiGateway::Stage');
+  expect(Object.keys(stages)).toHaveLength(2);
+  for (const s of Object.values<any>(stages)) {
+    expect(s.Properties.AccessLogSetting.DestinationArn).toBeDefined();
+  }
+});
+
+test('SQS consumers have bounded concurrency', () => {
+  template.hasResourceProperties('AWS::Lambda::EventSourceMapping', { BatchSize: 1, ScalingConfig: { MaximumConcurrency: 2 } });
+  template.hasResourceProperties('AWS::Lambda::EventSourceMapping', { BatchSize: 10, ScalingConfig: { MaximumConcurrency: 5 } });
+});
+
 test('Cognito has the three workflow role groups', () => {
   for (const g of ['staff', 'supervisor', 'compliance']) {
     template.hasResourceProperties('AWS::Cognito::UserPoolGroup', { GroupName: g });
