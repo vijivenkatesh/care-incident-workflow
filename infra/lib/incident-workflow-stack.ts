@@ -13,6 +13,7 @@ import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as kms from 'aws-cdk-lib/aws-kms';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import { SqsEventSource } from 'aws-cdk-lib/aws-lambda-event-sources';
 import * as logs from 'aws-cdk-lib/aws-logs';
@@ -23,6 +24,7 @@ import * as sns from 'aws-cdk-lib/aws-sns';
 import * as subs from 'aws-cdk-lib/aws-sns-subscriptions';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
+import { skipCheckov } from './checkov';
 import { buildApiSpec } from './openapi';
 
 export interface IncidentWorkflowStackProps extends StackProps {
@@ -133,8 +135,24 @@ export class IncidentWorkflowStack extends Stack {
     const audit = queueWithDlq('AuditQueue');
     const regulator = queueWithDlq('RegulatorQueue');
 
-    const notifications = new sns.Topic(this, 'NotificationsTopic', { displayName: 'Care incident notifications', enforceSSL: true });
-    const opsAlerts = new sns.Topic(this, 'OpsAlertsTopic', { displayName: 'Care incident ops alarms', enforceSSL: true });
+    // Customer-managed key for the SNS topics. The AWS-managed aws/sns key can't be used here:
+    // its key policy can't be edited, so EventBridge and CloudWatch alarms couldn't publish.
+    const messagingKey = new kms.Key(this, 'MessagingKey', {
+      description: 'Encrypts the incident notification and ops alarm SNS topics',
+      enableKeyRotation: true,
+      pendingWindow: Duration.days(7),
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+    messagingKey.addToResourcePolicy(new iam.PolicyStatement({
+      sid: 'AllowPublishersToUseKey',
+      principals: [new iam.ServicePrincipal('events.amazonaws.com'), new iam.ServicePrincipal('cloudwatch.amazonaws.com')],
+      actions: ['kms:Decrypt', 'kms:GenerateDataKey'],
+      resources: ['*'], // in a key policy, "*" means this key
+    }));
+    const topic = (id: string, displayName: string) =>
+      new sns.Topic(this, id, { displayName, enforceSSL: true, masterKey: messagingKey });
+    const notifications = topic('NotificationsTopic', 'Care incident notifications');
+    const opsAlerts = topic('OpsAlertsTopic', 'Care incident ops alarms');
     if (props.notifyEmail) {
       notifications.addSubscription(new subs.EmailSubscription(props.notifyEmail));
       opsAlerts.addSubscription(new subs.EmailSubscription(props.notifyEmail));
@@ -190,8 +208,13 @@ export class IncidentWorkflowStack extends Stack {
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       encryption: s3.BucketEncryption.S3_MANAGED,
       enforceSSL: true,
+      versioned: true, // roll back a bad frontend release
+      lifecycleRules: [{ noncurrentVersionExpiration: Duration.days(30) }],
       removalPolicy: RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
+    });
+    skipCheckov(siteBucket, {
+      CKV_AWS_18: 'Private bucket read only by CloudFront through OAC; request logging belongs at CloudFront',
     });
     const distribution = new cloudfront.Distribution(this, 'Site', {
       defaultRootObject: 'index.html',

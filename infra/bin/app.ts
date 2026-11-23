@@ -2,6 +2,7 @@
 import { App, Aspects, Tags } from 'aws-cdk-lib';
 import { IncidentWorkflowStack } from '../lib/incident-workflow-stack';
 import { NoWildcardActions } from '../lib/guardrails';
+import { CheckovSuppressions } from '../lib/checkov';
 
 const app = new App();
 
@@ -14,3 +15,4 @@ const stack = new IncidentWorkflowStack(app, 'CareIncidentWorkflow', {
 
 Tags.of(stack).add('project', 'care-incident-workflow');
 Aspects.of(app).add(new NoWildcardActions());
+Aspects.of(app).add(new CheckovSuppressions());
