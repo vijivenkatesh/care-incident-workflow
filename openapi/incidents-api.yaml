@@ -1,0 +1,266 @@
+openapi: 3.0.1
+info:
+  title: Care Incident Workflow API
+  version: 1.0.0
+  description: |
+    Contract-first API for a role-based incident reporting workflow.
+    This file is the single source of truth: the CDK stack deploys API Gateway
+    from it (injecting Lambda integrations and the Cognito authorizer at synth
+    time) and the React app generates its TypeScript types from it.
+
+    Roles come from Cognito groups in the JWT (`cognito:groups`):
+      - staff:      create, edit own drafts/returned incidents, submit
+      - supervisor: start review, approve or return
+      - compliance: report approved incidents to the regulator, close
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+servers:
+  - url: https://{apiId}.execute-api.{region}.amazonaws.com/v1
+    variables:
+      apiId:
+        default: example
+      region:
+        default: ap-southeast-2
+security:
+  - CognitoJwt: []
+paths:
+  /incidents:
+    get:
+      operationId: listIncidents
+      summary: List incidents visible to the caller
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/IncidentStatus'
+      responses:
+        '200':
+          description: Incidents
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Incident'
+        '401':
+          $ref: '#/components/responses/Error'
+    post:
+      operationId: createIncident
+      summary: Create a draft incident (staff)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IncidentInput'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Incident'
+        '400':
+          $ref: '#/components/responses/Error'
+        '403':
+          $ref: '#/components/responses/Error'
+  /incidents/{incidentId}:
+    parameters:
+      - $ref: '#/components/parameters/IncidentId'
+    get:
+      operationId: getIncident
+      summary: Get one incident with its history and the caller's allowed actions
+      responses:
+        '200':
+          description: Incident
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Incident'
+        '404':
+          $ref: '#/components/responses/Error'
+    put:
+      operationId: updateIncident
+      summary: Edit a DRAFT or RETURNED incident (owner only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IncidentInput'
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Incident'
+        '400':
+          $ref: '#/components/responses/Error'
+        '403':
+          $ref: '#/components/responses/Error'
+        '409':
+          $ref: '#/components/responses/Error'
+  /incidents/{incidentId}/transitions:
+    parameters:
+      - $ref: '#/components/parameters/IncidentId'
+    post:
+      operationId: transitionIncident
+      summary: Move an incident through the workflow
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransitionRequest'
+      responses:
+        '200':
+          description: Transitioned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Incident'
+        '400':
+          $ref: '#/components/responses/Error'
+        '403':
+          $ref: '#/components/responses/Error'
+        '409':
+          $ref: '#/components/responses/Error'
+components:
+  securitySchemes:
+    CognitoJwt:
+      type: apiKey
+      name: Authorization
+      in: header
+      description: Cognito-issued OIDC ID token (JWT). The authorizer is injected by CDK.
+  parameters:
+    IncidentId:
+      name: incidentId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: '^[0-9a-f-]{36}$'
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+  schemas:
+    IncidentStatus:
+      type: string
+      enum: [DRAFT, SUBMITTED, UNDER_REVIEW, RETURNED, APPROVED, REPORTED, CLOSED]
+    Severity:
+      type: string
+      enum: [LOW, MEDIUM, HIGH, CRITICAL]
+    Action:
+      type: string
+      enum: [SUBMIT, START_REVIEW, APPROVE, RETURN, REPORT, CLOSE]
+    IncidentInput:
+      type: object
+      additionalProperties: false
+      required: [title, description, severity, occurredAt]
+      properties:
+        title:
+          type: string
+          minLength: 3
+          maxLength: 120
+        description:
+          type: string
+          minLength: 10
+          maxLength: 4000
+        severity:
+          $ref: '#/components/schemas/Severity'
+        occurredAt:
+          type: string
+          format: date-time
+        location:
+          type: string
+          maxLength: 200
+    TransitionRequest:
+      type: object
+      additionalProperties: false
+      required: [action]
+      properties:
+        action:
+          $ref: '#/components/schemas/Action'
+        comment:
+          type: string
+          maxLength: 1000
+    HistoryEntry:
+      type: object
+      required: [at, by, action, from, to]
+      properties:
+        at:
+          type: string
+          format: date-time
+        by:
+          type: string
+        action:
+          type: string
+        from:
+          type: string
+        to:
+          type: string
+        comment:
+          type: string
+    Incident:
+      type: object
+      required: [id, title, description, severity, occurredAt, status, createdBy, createdAt, updatedAt, version, history, allowedActions]
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        description:
+          type: string
+        severity:
+          $ref: '#/components/schemas/Severity'
+        occurredAt:
+          type: string
+          format: date-time
+        location:
+          type: string
+        status:
+          $ref: '#/components/schemas/IncidentStatus'
+        createdBy:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        version:
+          type: integer
+        regulatorReference:
+          type: string
+        history:
+          type: array
+          items:
+            $ref: '#/components/schemas/HistoryEntry'
+        allowedActions:
+          type: array
+          description: Actions the caller may take now. The UI renders buttons from this list.
+          items:
+            $ref: '#/components/schemas/Action'
+        canEdit:
+          type: boolean
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        correlationId:
+          type: string
