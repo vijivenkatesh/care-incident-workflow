@@ -85,9 +85,13 @@ jobs:
       - run: npx jest
       - run: npx cdk synth -q   # fails on guardrail errors, e.g. IAM "*" actions
       - name: IaC security scan (checkov)
-        run: |
-          pip install checkov==3.2.334
-          checkov -d cdk.out --framework cloudformation --quiet --compact --soft-fail
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: infra/cdk.out
+          framework: cloudformation
+          quiet: true
+          compact: true
+          soft_fail: true
       - uses: actions/upload-artifact@v4
         with:
           name: cdk-out
